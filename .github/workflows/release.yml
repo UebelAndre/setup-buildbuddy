@@ -1,0 +1,92 @@
+name: Release
+
+# Two ways to cut a release, both from the GitHub UI, neither needs a local tag push:
+#
+# 1. Actions -> Release -> "Run workflow": pick patch/minor/major (or type an
+#    exact version). The workflow computes the tag, creates the GitHub Release
+#    with generated notes, and moves the floating major tag (v1 -> v1.2.3).
+#
+# 2. Releases -> "Draft a new release": type a new tag such as v1.2.3, publish.
+#    The `release: published` event then moves the floating major tag.
+#
+# Releases created by this workflow use GITHUB_TOKEN, which deliberately does
+# not fire `release: published`, so path 1 moves the major tag itself.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Part of the version to bump
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: Exact version to release instead (vX.Y.Z). Overrides bump.
+        type: string
+        default: ''
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pick version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXACT: ${{ inputs.version }}
+        run: |
+          if [[ -n "$EXACT" ]]; then
+            .github/scripts/release.sh validate "$EXACT"
+            tag="$EXACT"
+          else
+            tag="$(.github/scripts/release.sh next "$BUMP")"
+          fi
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::Tag $tag already exists"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag from $GITHUB_SHA"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+
+      - name: Move floating major tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          .github/scripts/release.sh float "$TAG"
+
+  float:
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Move floating major tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          .github/scripts/release.sh validate "$TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          .github/scripts/release.sh float "$TAG"

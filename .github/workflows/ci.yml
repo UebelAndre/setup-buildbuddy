@@ -1,0 +1,251 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Lint, type-check, test, rebuild, and fail if anything generated (dist/,
+  # package-lock.json) or pinned (Node version) is out of sync. Runs in the
+  # same container developers use locally via tools/dev.sh, so results match.
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: tools/dev.sh tools/check-sync.sh
+
+  # Exercises the action in every mode on every OS without touching the network.
+  configure:
+    name: configure (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: read-write key wins over read-only key
+        id: rw
+        uses: ./
+        with:
+          api-key: fake-write-key
+          read-only-api-key: fake-read-key
+          bazelrc-path: ${{ runner.temp }}/rw.bazelrc
+          # Steps in this job that share the default `common` prefix would share
+          # the default flags file too, so the colliding ones name their own.
+          flags-file: ${{ runner.temp }}/rw.flags.bazelrc
+          build-metadata: |
+            TAGS=ci,setup-buildbuddy
+          bazelrc: |
+            build --jobs=16
+
+      - name: re-running with the same prefix rewrites the flags file and keeps one import
+        id: rw2
+        uses: ./
+        with:
+          api-key: fake-write-key-2
+          bazelrc-path: ${{ runner.temp }}/rw.bazelrc
+          flags-file: ${{ runner.temp }}/rw.flags.bazelrc
+
+      - name: read-only key disables uploads
+        id: ro
+        uses: ./
+        with:
+          read-only-api-key: fake-read-key
+          bazelrc-path: ${{ runner.temp }}/ro.bazelrc
+          config: buildbuddy
+          cache-compression: true
+
+      - name: auth-only writes just the header
+        id: auth
+        uses: ./
+        with:
+          read-only-api-key: fake-read-key
+          auth-only: true
+          read-only-disable-uploads: false
+          config: remote
+          bazelrc-path: ${{ runner.temp }}/auth.bazelrc
+
+      - name: no key, default warns and skips
+        id: skip
+        uses: ./
+        with:
+          bazelrc-path: ${{ runner.temp }}/skip.bazelrc
+
+      - name: no key, quiet skip
+        id: quiet
+        uses: ./
+        with:
+          missing-key: skip
+          bazelrc-path: ${{ runner.temp }}/quiet.bazelrc
+
+      - name: key from environment variable
+        id: envkey
+        uses: ./
+        env:
+          BUILDBUDDY_READ_ONLY_API_KEY: fake-env-key
+        with:
+          bazelrc-path: ${{ runner.temp }}/envkey.bazelrc
+          flags-file: ${{ runner.temp }}/envkey.flags.bazelrc
+
+      - name: no key, anonymous
+        id: anon
+        uses: ./
+        with:
+          missing-key: anonymous
+          remote-cache: false
+          bazelrc-path: ${{ runner.temp }}/anon.bazelrc
+          flags-file: ${{ runner.temp }}/anon.flags.bazelrc
+
+      - name: no key, error
+        id: err
+        continue-on-error: true
+        uses: ./
+        with:
+          missing-key: error
+          bazelrc-path: ${{ runner.temp }}/err.bazelrc
+
+      - name: default rc location (user home)
+        id: home
+        uses: ./
+        with:
+          api-key: fake-home-key
+          config: home
+
+      - name: Assert
+        shell: bash
+        env:
+          TMP: ${{ runner.temp }}
+          RW_MODE: ${{ steps.rw.outputs.mode }}
+          RW_FLAGS: ${{ steps.rw.outputs.flags-file }}
+          RW2_FLAGS: ${{ steps.rw2.outputs.flags-file }}
+          RO_MODE: ${{ steps.ro.outputs.mode }}
+          RO_FLAGS: ${{ steps.ro.outputs.flags-file }}
+          AUTH_MODE: ${{ steps.auth.outputs.mode }}
+          AUTH_FLAGS: ${{ steps.auth.outputs.flags-file }}
+          SKIP_MODE: ${{ steps.skip.outputs.mode }}
+          SKIP_AUTH: ${{ steps.skip.outputs.authenticated }}
+          QUIET_MODE: ${{ steps.quiet.outputs.mode }}
+          ENVKEY_MODE: ${{ steps.envkey.outputs.mode }}
+          ENVKEY_FLAGS: ${{ steps.envkey.outputs.flags-file }}
+          ANON_MODE: ${{ steps.anon.outputs.mode }}
+          ANON_FLAGS: ${{ steps.anon.outputs.flags-file }}
+          ERR_OUTCOME: ${{ steps.err.outcome }}
+          HOME_RC: ${{ steps.home.outputs.bazelrc-path }}
+          HOME_FLAGS: ${{ steps.home.outputs.flags-file }}
+        run: |
+          set -euxo pipefail
+          # Negated commands do not trip errexit, so negative checks go through this.
+          absent() {
+            if grep -q -- "$1" "$2"; then
+              echo "::error::unexpected '$1' in $2"
+              return 1
+            fi
+          }
+          echo "--- rw.bazelrc"; cat "$TMP/rw.bazelrc"
+          echo "--- rw flags"; cat "$RW_FLAGS"
+
+          [[ "$RW_MODE" == read-write ]]
+          [[ "$RW_FLAGS" == "$RW2_FLAGS" ]]
+          # Exactly one import line, pointing at the flags file (forward slashes).
+          [[ "$(grep -c '^import ' "$TMP/rw.bazelrc")" == 1 ]]
+          grep -qxF "import ${RW_FLAGS//\\//}" "$TMP/rw.bazelrc"
+          absent 'remote_header' "$TMP/rw.bazelrc"
+          # The second run rewrote the flags file: new key, no leftovers.
+          [[ "$(grep -c 'remote_header' "$RW_FLAGS")" == 1 ]]
+          grep -qx 'common --remote_header=x-buildbuddy-api-key=fake-write-key-2' "$RW_FLAGS"
+          absent 'jobs=16' "$RW_FLAGS"
+          grep -qx 'common --bes_backend=grpcs://remote.buildbuddy.io' "$RW_FLAGS"
+          grep -qx 'common --remote_cache=grpcs://remote.buildbuddy.io' "$RW_FLAGS"
+          grep -qx 'common --remote_timeout=10m' "$RW_FLAGS"
+          absent 'noremote_upload_local_results' "$RW_FLAGS"
+
+          [[ "$RO_MODE" == read-only ]]
+          [[ "$RO_FLAGS" != "$RW_FLAGS" ]]
+          grep -qx 'common:buildbuddy --remote_header=x-buildbuddy-api-key=fake-read-key' "$RO_FLAGS"
+          grep -qx 'common:buildbuddy --noremote_upload_local_results' "$RO_FLAGS"
+          grep -qx 'common:buildbuddy --remote_cache_compression' "$RO_FLAGS"
+          [[ "$(grep -vc '^#' "$RO_FLAGS")" == 8 ]]
+
+          [[ "$AUTH_MODE" == read-only ]]
+          grep -qx 'common:remote --remote_header=x-buildbuddy-api-key=fake-read-key' "$AUTH_FLAGS"
+          [[ "$(grep -vc '^#' "$AUTH_FLAGS")" == 1 ]]
+
+          [[ "$SKIP_MODE" == disabled && "$SKIP_AUTH" == false ]]
+          [[ ! -e "$TMP/skip.bazelrc" ]]
+          [[ "$QUIET_MODE" == disabled && ! -e "$TMP/quiet.bazelrc" ]]
+
+          [[ "$ENVKEY_MODE" == read-only ]]
+          grep -qx 'common --remote_header=x-buildbuddy-api-key=fake-env-key' "$ENVKEY_FLAGS"
+
+          [[ "$ANON_MODE" == anonymous ]]
+          absent 'remote_header' "$ANON_FLAGS"
+          absent 'remote_cache' "$ANON_FLAGS"
+          grep -qx 'common --bes_backend=grpcs://remote.buildbuddy.io' "$ANON_FLAGS"
+
+          [[ "$ERR_OUTCOME" == failure ]]
+
+          # Default location is the user rc file, which Bazel loads on its own.
+          echo "--- $HOME_RC"; cat "$HOME_RC"
+          [[ "$(basename "$HOME_RC")" == .bazelrc ]]
+          grep -qxF "import ${HOME_FLAGS//\\//}" "$HOME_RC"
+          grep -qx 'common:home --remote_header=x-buildbuddy-api-key=fake-home-key' "$HOME_FLAGS"
+
+          # The flags file is usable on its own via --bazelrc.
+          [[ -n "${BUILDBUDDY_BAZELRC:-}" && -f "$BUILDBUDDY_BAZELRC" ]]
+
+  # End-to-end: setup-bazel first, then this action, then a real Bazel build
+  # that streams to BuildBuddy. On pushes the write key secret is used; fork
+  # pull requests fall back to the read-only variable, then to anonymous BES.
+  bazel:
+    name: bazel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazel-contrib/setup-bazel@0.19.1
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+          module-root: test/workspace
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Setup BuildBuddy
+        id: buildbuddy
+        uses: ./
+        with:
+          api-key: ${{ secrets.BUILDBUDDY_API_KEY }}
+          read-only-api-key: ${{ vars.BUILDBUDDY_READ_ONLY_API_KEY }}
+          missing-key: anonymous
+          # Anonymous requests cannot use the cache; only enable it with a key.
+          remote-cache: ${{ secrets.BUILDBUDDY_API_KEY != '' || vars.BUILDBUDDY_READ_ONLY_API_KEY != '' }}
+          visibility: PUBLIC
+
+      # Uses the runner's default shell (PowerShell on Windows): the action
+      # itself needs no shell at all. Bazel fails the build outright when it
+      # cannot reach the remote cache or BES, and hosted runners occasionally
+      # hit transient DNS failures, so one retry is allowed.
+      - name: Build
+        id: build
+        continue-on-error: true
+        working-directory: test/workspace
+        run: |
+          echo "mode=${{ steps.buildbuddy.outputs.mode }}"
+          bazel build //...
+
+      - name: Build (retry after transient failure)
+        if: steps.build.outcome == 'failure'
+        working-directory: test/workspace
+        run: bazel build //...

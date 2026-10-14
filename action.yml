@@ -1,0 +1,153 @@
+name: Setup BuildBuddy
+description: >-
+  Configure Bazel to use BuildBuddy (build event service, remote cache and
+  optional remote execution) with the right API key for the current job.
+author: UebelAndre
+branding:
+  icon: zap
+  color: green
+
+inputs:
+  # ---- Authentication -------------------------------------------------------
+  api-key:
+    description: >-
+      BuildBuddy API key with cache write access. Pass a GitHub secret, for
+      example the value of secrets.BUILDBUDDY_API_KEY. GitHub withholds
+      secrets from pull requests opened from forks, so this input is empty
+      there and the action falls back to `read-only-api-key`. If the input is
+      empty, the BUILDBUDDY_API_KEY environment variable is used instead.
+    required: false
+    default: ''
+  read-only-api-key:
+    description: >-
+      BuildBuddy API key created with "Read-only key (disable remote cache
+      uploads)". Used when `api-key` is empty. Pass a GitHub variable, for
+      example the value of vars.BUILDBUDDY_READ_ONLY_API_KEY, if fork pull
+      requests should be able to read the cache, or a secret otherwise. If the
+      input is empty, the BUILDBUDDY_READ_ONLY_API_KEY environment variable is
+      used instead.
+    required: false
+    default: ''
+  missing-key:
+    description: >-
+      What to do when neither key is available (inputs and environment):
+      `warn` skips BuildBuddy configuration with a warning annotation, `skip`
+      does the same quietly, `anonymous` configures BuildBuddy without an API
+      key (BES only, invocations are public to anyone with the link), `error`
+      fails the step.
+    required: false
+    default: warn
+  export-env:
+    description: >-
+      Also export the selected key as the `BUILDBUDDY_API_KEY` environment
+      variable for later steps (for the `bb` CLI, curl, etc.).
+    required: false
+    default: 'false'
+  auth-only:
+    description: >-
+      Write only the API key header (`--remote_header=x-buildbuddy-api-key=...`)
+      and nothing else. Use this when your own `.bazelrc` already defines how
+      to talk to BuildBuddy (for example `build:remote` / `build:bes` configs)
+      and you select a config per invocation. Endpoint and feature inputs
+      below are ignored.
+    required: false
+    default: 'false'
+  read-only-disable-uploads:
+    description: >-
+      When a read-only key is selected, also write `--noremote_upload_local_results`
+      so Bazel does not attempt cache uploads the key cannot perform. Applies
+      in `auth-only` mode too.
+    required: false
+    default: 'true'
+
+  # ---- BuildBuddy endpoints and features -----------------------------------
+  remote-endpoint:
+    description: gRPC endpoint used for BES, remote cache and remote execution.
+    required: false
+    default: grpcs://remote.buildbuddy.io
+  app-url:
+    description: Base URL of the BuildBuddy UI, used to build `--bes_results_url`.
+    required: false
+    default: https://app.buildbuddy.io
+  bes:
+    description: Stream build events to BuildBuddy (`--bes_backend`, `--bes_results_url`).
+    required: false
+    default: 'true'
+  remote-cache:
+    description: Use BuildBuddy as a remote cache (`--remote_cache`).
+    required: false
+    default: 'true'
+  remote-execution:
+    description: Use BuildBuddy remote execution (`--remote_executor`). Requires toolchain setup in your repo.
+    required: false
+    default: 'false'
+  remote-timeout:
+    description: Value for `--remote_timeout`. Empty omits the flag.
+    required: false
+    default: 10m
+  cache-compression:
+    description: Add `--remote_cache_compression` (zstd, Bazel 7+).
+    required: false
+    default: 'false'
+  download-toplevel:
+    description: Add `--remote_download_toplevel` to avoid downloading intermediate outputs.
+    required: false
+    default: 'false'
+  visibility:
+    description: Set `--build_metadata=VISIBILITY=...`. Use `PUBLIC` to make authenticated invocations viewable by anyone with the link.
+    required: false
+    default: ''
+  build-metadata:
+    description: Extra `KEY=VALUE` lines, each written as `--build_metadata=KEY=VALUE`.
+    required: false
+    default: ''
+
+  # ---- Where and how flags are written --------------------------------------
+  rc-command:
+    description: >-
+      Bazel command the flags are attached to in the rc file. `common`
+      (BuildBuddy's recommendation) applies to every command; use `build`
+      for Bazel versions older than 7.
+    required: false
+    default: common
+  config:
+    description: >-
+      If set, flags are written as `<rc-command>:<config>` so they only apply
+      when Bazel is invoked with `--config=<config>`.
+    required: false
+    default: ''
+  bazelrc-path:
+    description: >-
+      Rc file that receives the `import` line. Defaults to the user rc file
+      (`$HOME/.bazelrc`, plus `%USERPROFILE%\.bazelrc` on Windows), which
+      Bazel loads automatically. If you use bazel-contrib/setup-bazel, run it
+      BEFORE this action: it truncates `$HOME/.bazelrc` and would drop the
+      import line.
+    required: false
+    default: ''
+  flags-file:
+    description: >-
+      Standalone rc file that holds the generated flags (including the API
+      key). Defaults to `$RUNNER_TEMP/setup-buildbuddy/<rc-command>[-<config>].bazelrc`.
+      Its path is exported as `BUILDBUDDY_BAZELRC` and can be passed to Bazel
+      with `--bazelrc` directly.
+    required: false
+    default: ''
+  bazelrc:
+    description: Extra lines to append to the flags file after the BuildBuddy flags.
+    required: false
+    default: ''
+
+outputs:
+  mode:
+    description: One of `read-write`, `read-only`, `anonymous`, `disabled`.
+  authenticated:
+    description: '`true` when an API key was configured.'
+  bazelrc-path:
+    description: The rc file that imports the flags file (empty when mode is `disabled`).
+  flags-file:
+    description: The standalone rc file holding the generated flags (empty when mode is `disabled`). Usable with `bazel --bazelrc=<flags-file>`.
+
+runs:
+  using: node24
+  main: dist/index.js
